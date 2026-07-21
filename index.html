@@ -214,6 +214,13 @@
   .sheet .row{ display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
   .sheet .row button{ border:1px solid var(--line-2); background:var(--paper); border-radius:10px; padding:10px 14px; cursor:pointer; font-size:14px; }
   .sheet .row button.primary{ background:var(--ink); color:#fff; border-color:var(--ink); }
+  .sheet .bkrow{ border:1px solid var(--line-2); border-radius:12px; padding:12px; margin-top:6px; }
+  .sheet .bkrow label{ display:flex; align-items:center; gap:9px; font-size:14px; cursor:pointer; }
+  .sheet .bkrow input[type=checkbox]{ width:18px; height:18px; flex:0 0 auto; }
+  .sheet .bkrow small{ display:block; margin-top:7px; font-size:12px; line-height:1.5; color:var(--ink-soft); }
+  .sheet .bkstatus{ margin-top:12px; font-size:13px; line-height:1.5; border:1px solid var(--line-2);
+                    border-radius:10px; padding:10px 12px; word-break:break-word; }
+  .sheet .bkstatus b{ font-weight:600; }
   .tabs{ display:flex; gap:6px; border-bottom:1px solid var(--line); margin:14px 0 16px; }
   .tabs button{ border:0; background:none; padding:10px 12px; font-size:13.5px; color:var(--ink-faint); cursor:pointer;
                 border-bottom:2px solid transparent; margin-bottom:-1px; }
@@ -675,6 +682,7 @@
       </div>
       <button id="navStats" class="hnavitem"><span class="ic">📈</span> Stats</button>
       <button id="editBtn" class="hnavitem"><span class="ic">⚙</span> Edit</button>
+      <button id="backupBtn" class="hnavitem"><span class="ic">⇅</span> Backup</button>
       <button id="addBtnM" class="hnavitem addm"><span class="ic">+</span> Add</button>
     </div>
     <div class="hrailfill"></div>
@@ -880,6 +888,36 @@
     <div id="statsBody"></div>
     <div class="row">
       <button id="statsClose">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- backup & restore -->
+<div id="backupSheet" class="sheet">
+  <div class="box">
+    <h3>Backup &amp; Restore</h3>
+    <p>Move everything — highlights, notes, ink, reading position, stats, reading list, genres, themes and
+       settings — from one copy of Lumen to another. Works between the file you open from WhatsApp and the
+       one you host online, in either direction.</p>
+
+    <div class="bkrow">
+      <label><input type="checkbox" id="bkWithBooks" /> Also include the PDF files themselves</label>
+      <small>Leave this off unless you need it. Without it the backup is small and fast, and your library still
+      comes back — just re-add the same PDF files afterwards and every highlight, note and page position
+      re-attaches to them automatically. With it on, the file can be hundreds of megabytes and may run the
+      tablet out of memory.</small>
+    </div>
+
+    <div class="row">
+      <button id="bkExport" class="primary">↓ Export my data</button>
+      <button id="bkImportPick">↑ Import a backup</button>
+      <input id="bkFile" type="file" accept="application/json,.json" hidden />
+    </div>
+
+    <div id="bkStatus" class="bkstatus" style="display:none"></div>
+
+    <div class="row">
+      <button id="bkClose">Close</button>
     </div>
   </div>
 </div>
@@ -5454,5 +5492,281 @@ if($('#railHomeBtn')) $('#railHomeBtn').onclick = showHome;
   else setEngine('device');
 
   showHome();      // open on the reading library; Continue Reading resumes the last book
+})();
+
+/* ============================================================================
+   BACKUP & RESTORE
+   Everything Lumen owns lives in exactly two places: the IndexedDB store 'kv',
+   and the localStorage keys prefixed 'lumen:'. This walks both, writes one JSON
+   file, and can read that file back. Written for a 4 GB tablet: the export is
+   streamed into Blob pieces instead of one giant string, big binaries are
+   base64'd in 32 KB slices, and the loop yields to the UI every few records so
+   the tablet never looks frozen.
+============================================================================ */
+(function(){
+
+  /* keys whose value can be rebuilt from the PDF, so they are optional */
+  var HEAVY = /^(bytes:|pg:|img:|meta:)/;
+
+  var bkBusy = false;
+
+  function bkStatus(html){
+    var el = document.getElementById('bkStatus');
+    if(!el) return;
+    if(html === false){ el.style.display='none'; el.innerHTML=''; return; }
+    el.style.display='';
+    el.innerHTML = html;
+  }
+  function bkLock(on){
+    bkBusy = on;
+    var a = document.getElementById('bkExport'), b = document.getElementById('bkImportPick');
+    if(a) a.disabled = on;
+    if(b) b.disabled = on;
+  }
+  function niceSize(n){
+    if(n < 1024) return n + ' B';
+    if(n < 1024*1024) return (n/1024).toFixed(0) + ' KB';
+    return (n/1024/1024).toFixed(1) + ' MB';
+  }
+
+  /* ---- binary <-> text ---------------------------------------------------- */
+  var BINTAG = /^\[object (ArrayBuffer|DataView|(Ui|I)nt(8|16|32)(Clamped)?Array|Float(32|64)Array|BigUint64Array|BigInt64Array)\]$/;
+  function tagOf(v){ return Object.prototype.toString.call(v); }
+  function isBinary(v){
+    if(!v || typeof v !== 'object') return false;
+    if(v instanceof ArrayBuffer) return true;
+    if(ArrayBuffer.isView && ArrayBuffer.isView(v)) return true;
+    return BINTAG.test(tagOf(v));   /* also catches objects from another realm */
+  }
+  function isDate(v){ return v instanceof Date || tagOf(v) === '[object Date]'; }
+  function toB64(v){
+    var isBuf = (v instanceof ArrayBuffer) || tagOf(v) === '[object ArrayBuffer]';
+    var bytes = isBuf ? new Uint8Array(v)
+              : new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+    var CH = 0x8000, out = [];
+    for(var i=0; i<bytes.length; i+=CH){
+      out.push(String.fromCharCode.apply(null, bytes.subarray(i, i+CH)));
+    }
+    return btoa(out.join(''));
+  }
+  function fromB64(b64){
+    var bin = atob(b64), len = bin.length, bytes = new Uint8Array(len);
+    for(var i=0; i<len; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes.buffer;
+  }
+  /* wrap a value so its type survives the round trip through JSON */
+  function pack(v){
+    if(isBinary(v)) return { __lumenType:'binary', data: toB64(v) };
+    if(isDate(v)) return { __lumenType:'date', data: v.getTime() };
+    return v;
+  }
+  function unpack(v){
+    if(v && typeof v === 'object' && v.__lumenType){
+      if(v.__lumenType === 'binary') return fromB64(v.data);
+      if(v.__lumenType === 'date')   return new Date(v.data);
+    }
+    return v;
+  }
+
+  /* ---- EXPORT ------------------------------------------------------------- */
+  async function doExport(){
+    if(bkBusy) return;
+    var withBooks = !!(document.getElementById('bkWithBooks') || {}).checked;
+    bkLock(true);
+    bkStatus('Gathering your data\u2026');
+
+    try{
+      /* every localStorage key we own */
+      var local = {}, i, k;
+      for(i=0; i<localStorage.length; i++){
+        k = localStorage.key(i);
+        if(k && k.indexOf('lumen:') === 0) local[k] = localStorage.getItem(k);
+      }
+
+      /* every IndexedDB key */
+      var keys = [];
+      try{ keys = (await store.keys()) || []; }catch(e){ keys = []; }
+      keys = keys.filter(function(x){ return typeof x === 'string'; });
+      if(!withBooks) keys = keys.filter(function(x){ return !HEAVY.test(x); });
+
+      var pieces = [];
+      pieces.push('{"lumen":true,"format":1,"createdAt":' + JSON.stringify(new Date().toISOString()) +
+                  ',"includesBooks":' + (withBooks ? 'true' : 'false') +
+                  ',"local":' + JSON.stringify(local) +
+                  ',"idb":{');
+
+      var written = 0, skipped = 0, first = true;
+      for(i=0; i<keys.length; i++){
+        var key = keys[i], val;
+        try{ val = await store.get(key); }catch(e){ skipped++; continue; }
+        if(val === undefined){ skipped++; continue; }
+        var text;
+        try{ text = JSON.stringify(pack(val)); }catch(e){ skipped++; continue; }
+        if(text === undefined){ skipped++; continue; }
+        pieces.push((first ? '' : ',') + JSON.stringify(key) + ':' + text);
+        first = false;
+        written++;
+        if(i % 6 === 5){
+          bkStatus('Gathering\u2026 <b>' + written + '</b> of ' + keys.length + ' records.');
+          await yieldToUI();
+        }
+      }
+      pieces.push('}}');
+
+      bkStatus('Building the file\u2026');
+      await yieldToUI();
+
+      var blob = new Blob(pieces, { type:'application/json' });
+      pieces.length = 0;
+
+      var stamp = new Date();
+      var pad = function(n){ return (n<10?'0':'') + n; };
+      var name = 'lumen_backup_' + stamp.getFullYear() + pad(stamp.getMonth()+1) + pad(stamp.getDate())
+               + '_' + pad(stamp.getHours()) + pad(stamp.getMinutes()) + '.json';
+
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url; a.download = name; a.rel = 'noopener';
+      a.style.position = 'fixed'; a.style.left = '-9999px';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function(){
+        try{ document.body.removeChild(a); }catch(e){}
+        try{ URL.revokeObjectURL(url); }catch(e){}
+      }, 60000);
+
+      bkStatus('Saved <b>' + name + '</b> \u2014 ' + niceSize(blob.size) + ', ' + written + ' records'
+               + (Object.keys(local).length ? ' plus ' + Object.keys(local).length + ' quick-save entries' : '')
+               + (skipped ? '. ' + skipped + ' record(s) could not be read and were left out.' : '.')
+               + '<br>Look in your Downloads folder. Keep this file somewhere safe.');
+      toast('Backup downloaded.');
+    }catch(err){
+      bkStatus('Export failed: ' + ((err && err.message) || 'unknown error') +
+               '<br>If you ticked \u201Calso include the PDF files\u201D, try again with it unticked \u2014 the tablet may have run out of memory.');
+      toast('Backup failed.');
+    }
+    bkLock(false);
+  }
+
+  /* ---- IMPORT ------------------------------------------------------------- */
+  function readFileText(file){
+    return new Promise(function(res, rej){
+      var fr = new FileReader();
+      fr.onload  = function(){ res(String(fr.result || '')); };
+      fr.onerror = function(){ rej(fr.error || new Error('could not read the file')); };
+      try{ fr.readAsText(file); }catch(e){ rej(e); }
+    });
+  }
+
+  async function doImport(file){
+    if(bkBusy || !file) return;
+    bkLock(true);
+    bkStatus('Reading <b>' + file.name + '</b> (' + niceSize(file.size) + ')\u2026');
+
+    var data;
+    try{
+      var text = await readFileText(file);
+      bkStatus('Checking the file\u2026');
+      await yieldToUI();
+      data = JSON.parse(text);
+      text = null;
+    }catch(err){
+      bkLock(false);
+      bkStatus('That file could not be read as a Lumen backup. It may be damaged, or too large for this tablet to open in one go.');
+      return;
+    }
+
+    /* validate */
+    if(!data || typeof data !== 'object' || data.lumen !== true ||
+       typeof data.idb !== 'object' || data.idb === null ||
+       typeof data.local !== 'object' || data.local === null){
+      bkLock(false);
+      bkStatus('This does not look like a Lumen backup file. Pick the <b>lumen_backup\u2026.json</b> file you exported.');
+      return;
+    }
+
+    var idbKeys = Object.keys(data.idb);
+    var locKeys = Object.keys(data.local);
+    var when = data.createdAt ? String(data.createdAt).slice(0,10) : 'an unknown date';
+
+    var ok = window.confirm(
+      'Restore this backup?\n\n' +
+      'Made on: ' + when + '\n' +
+      'Records: ' + idbKeys.length + ' stored + ' + locKeys.length + ' quick-save\n' +
+      'Includes PDF files: ' + (data.includesBooks ? 'yes' : 'no') + '\n\n' +
+      'Anything already here under the same name will be overwritten. Lumen will reload when it finishes.'
+    );
+    if(!ok){ bkLock(false); bkStatus('Restore cancelled. Nothing was changed.'); return; }
+
+    var wrote = 0, failed = 0;
+    try{
+      /* localStorage first \u2014 it is synchronous and tiny */
+      for(var j=0; j<locKeys.length; j++){
+        var lk = locKeys[j];
+        if(lk.indexOf('lumen:') !== 0) continue;
+        try{ localStorage.setItem(lk, String(data.local[lk])); wrote++; }catch(e){ failed++; }
+      }
+
+      /* then IndexedDB, a record at a time, yielding so the screen stays alive */
+      for(var i=0; i<idbKeys.length; i++){
+        var key = idbKeys[i];
+        try{ await store.set(key, unpack(data.idb[key])); wrote++; }
+        catch(e){ failed++; }
+        if(i % 6 === 5){
+          bkStatus('Restoring\u2026 <b>' + (i+1) + '</b> of ' + idbKeys.length + ' records.');
+          await yieldToUI();
+        }
+      }
+    }catch(err){
+      bkLock(false);
+      bkStatus('Restore stopped partway: ' + ((err && err.message) || 'unknown error') +
+               '<br>' + wrote + ' record(s) did get saved. You can safely try again.');
+      return;
+    }
+
+    data = null;
+    bkStatus('Restored <b>' + wrote + '</b> record(s)'
+             + (failed ? ', ' + failed + ' could not be written' : '')
+             + '. Reloading Lumen so everything shows up\u2026');
+    toast('Backup restored \u2014 reloading.');
+
+    /* A reload is the honest way to bring the whole UI back in step: the library,
+       highlights, stats, themes and settings are all read fresh at startup. */
+    setTimeout(function(){ try{ location.reload(); }catch(e){} }, 900);
+  }
+
+  /* ---- wiring ------------------------------------------------------------- */
+  function openBackup(){
+    bkStatus(false);
+    document.getElementById('backupSheet').classList.add('show');
+    if(typeof homeMenuAutoClose === 'function') homeMenuAutoClose();
+  }
+  function closeBackup(){
+    if(bkBusy) return;
+    document.getElementById('backupSheet').classList.remove('show');
+  }
+
+  var btn = document.getElementById('backupBtn');
+  if(btn) btn.onclick = openBackup;
+
+  document.getElementById('bkClose').onclick = closeBackup;
+  document.getElementById('backupSheet').addEventListener('click', function(e){
+    if(e.target === document.getElementById('backupSheet')) closeBackup();
+  });
+  document.addEventListener('keydown', function(e){
+    if(e.code === 'Escape') closeBackup();
+  });
+
+  document.getElementById('bkExport').onclick = function(){ doExport(); };
+  document.getElementById('bkImportPick').onclick = function(){
+    if(bkBusy) return;
+    document.getElementById('bkFile').click();
+  };
+  document.getElementById('bkFile').addEventListener('change', function(e){
+    var f = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if(f) doImport(f);
+  });
+
 })();
 </script>
