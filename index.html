@@ -531,8 +531,8 @@
   .card:hover .carddone{ display:grid; }
   .donetag{ position:absolute; top:8px; right:8px; z-index:2; background:var(--ok); color:#fff;
             font-size:10.5px; font-weight:700; padding:3px 8px; border-radius:99px; letter-spacing:.02em; }
-  .card.isdone .cover{ opacity:.72; }
-  .card.isdone:hover .cover{ opacity:1; }
+  /* A finished book is still a book you liked the look of. The green ✓ Done
+     badge is enough to mark it — no reason to fade the artwork to say so. */
   @media (pointer:coarse){ .cardx, .carddone{ display:grid; } }
   .hempty{ color:var(--ink-faint); font-size:14px; text-align:center; padding:70px 20px; line-height:1.7; }
   /* edit mode */
